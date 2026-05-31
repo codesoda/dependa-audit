@@ -14,6 +14,7 @@ allowed-tools:
   - Bash(*/dependa-audit/scripts/docker-audit.sh*)
   - Bash(*/dependa-audit/scripts/python-audit.sh*)
   - Bash(*/dependa-audit/scripts/gha-audit.sh*)
+  - Bash(*/dependa-audit/scripts/go-audit.sh*)
   - Bash(curl:*)
   - Bash(npm pack:*)
   - Bash(npm view:*)
@@ -40,7 +41,7 @@ if there is one). Audit **one PR per invocation**.
 
 ## Helper scripts
 
-Five bundled scripts live in `scripts/` next to this SKILL.md. Resolve their
+Six bundled scripts live in `scripts/` next to this SKILL.md. Resolve their
 **absolute paths** (the directory this SKILL.md was loaded from) and pass them to
 each subagent. Each prints a bounded, structured report and ends with an
 INTERPRETATION GUIDE.
@@ -58,6 +59,12 @@ INTERPRETATION GUIDE.
   be tags or SHAs). Verifies ref/tag integrity (does the new commit map to a real
   published tag?), owner/archived status, the `action.yml` execution model + diff,
   changed-file classification, and known advisories. Uses the GitHub API (`gh`).
+- `scripts/go-audit.sh <module> <from> <to>` — Go modules. Confirms the checksum
+  transparency log (`sum.golang.org`) notarises both versions and the VCS origin ties
+  each to a real tag+commit, then diffs the reachable build/runtime surfaces Go
+  actually has — `init()`, cgo/`#cgo`, `//go:generate`, `//go:linkname` — plus
+  `go.mod` `require`/`replace` changes and new network hosts. Uses the Go proxy
+  (`proxy.golang.org`); no build, no `go` toolchain required.
 
 ## Steps
 
@@ -80,6 +87,8 @@ Make a todo list first.
      `uv.lock`, `Pipfile.lock`, `pdm.lock`)
    - github-actions: `.github/workflows/*.yml` (and `action.yml`) `uses: owner/repo@ref`
      pins — the bumped `ref` is a tag or commit SHA, usually with a `# vX` comment
+   - gomod: `go.mod` + `go.sum` — each `require` line is `<module> <version>`; the
+     `go.sum` has two hashes per module (`<module> <v>` and `<module> <v>/go.mod`)
    Include transitive bumps — those are exactly where a malicious release hides.
 
 3. **Form audit units.** One unit per package. You MAY group packages from the
@@ -96,7 +105,7 @@ Make a todo list first.
    general-purpose`. Give each subagent this brief (filled in for its unit):
 
    > You are auditing a dependency upgrade in a Dependabot PR for supply-chain
-   > risk. Package(s): `<names>`. Ecosystem: `<npm|cargo|docker|pypi|gha>`. Versions:
+   > risk. Package(s): `<names>`. Ecosystem: `<npm|cargo|docker|pypi|gha|gomod>`. Versions:
    > `<from>` → `<to>`.
    >
    > a. Run the bundled auditor and read its full output:
@@ -105,6 +114,7 @@ Make a todo list first.
    >    - docker: `<abs>/scripts/docker-audit.sh <image> <from-digest> <to-digest> <tag>`
    >    - pypi:   `<abs>/scripts/python-audit.sh <pkg> <from> <to>`
    >    - gha:    `<abs>/scripts/gha-audit.sh <owner/repo> <from-ref> <to-ref>`
+   >    - gomod:  `<abs>/scripts/go-audit.sh <module> <from> <to>`
    >    (For a monorepo group, run it once per package.)
    > b. Cross-check the **official changelog/release notes** for this exact version
    >    range (the package's GitHub releases/CHANGELOG via `gh release`/WebFetch).
@@ -132,6 +142,15 @@ Make a todo list first.
    >    `$GITHUB_ENV`/`$GITHUB_PATH`, `::set-env`), or secret reads paired with new
    >    network egress. If the script lists an advisory, check whether the upgrade
    >    crosses its fix — that is a reason to merge, not to block.
+   > f. (gomod only) Run `go-audit.sh <module> <from> <to>`. Go has no install
+   >    scripts, so the surfaces that run code are narrower and specific: a NEW
+   >    `init()` (runs on import), a NEW cgo/`#cgo` block (compiles C at build time),
+   >    or a NEW `//go:linkname`/`unsafe`/asm reach. The script reports these as
+   >    per-version COUNTS plus the ADDED lines — judge the *added* ones, not the
+   >    baseline (a syscall/crypto module legitimately carries hundreds). Confirm both
+   >    versions are `present in transparency log` and the VCS origin URL is unchanged;
+   >    a missing checksum entry or a changed origin is a serious flag. Also flag a new
+   >    `replace` pointing at a fork and any new external network host.
    >
    > Apply this judgment (do not over-flag — these are the false positives that
    > burned a prior reviewer): `process.env.TZ` reads and `function exec(){}`
@@ -147,12 +166,16 @@ Make a todo list first.
    > exfiltration. (GitHub Actions) big `node_modules`/`dist` churn and the action's
    > own `GITHUB_TOKEN`/GitHub-API use are expected, and a `node16→node20` runtime
    > bump is routine — flag new EXTERNAL egress, env-injection, or a SHA no tag points
-   > at. A real finding is NEW, unexplained, and runtime-reachable.
+   > at. (Go) high baseline counts of `unsafe`/asm/`//go:linkname` are expected in a
+   > syscall or crypto module and a `//go:generate` only runs on explicit `go generate`;
+   > judge what the bump ADDS — a new `init()`/cgo block doing network/exec/file I/O, a
+   > new `replace` to a fork, or a version missing from the checksum log. A real finding
+   > is NEW, unexplained, and runtime-reachable.
    >
    > Return ONLY this structure, no prose around it:
    > ```
    > UNIT: <package(s)>
-   > ECOSYSTEM: <npm|cargo|docker|pypi|gha>
+   > ECOSYSTEM: <npm|cargo|docker|pypi|gha|gomod>
    > VERSIONS: <from> -> <to>   (<direct|transitive>)
    > VERDICT: CLEAN | NOTE | SUSPICIOUS | BLOCK
    > install_hooks: <none | details>
@@ -287,7 +310,7 @@ a teammate.
 - Trust the scripts' endpoint/string-literal diffs over raw line counts on minified
   bundles. When a signal is ambiguous, prefer NOTE/SUSPICIOUS over silently
   dropping it — but back every flag with a concrete, verifiable fact.
-- The scripts need network (npm registry / crates.io / PyPI / Docker Hub / GitHub API). If one can't fetch a
-  version, its metadata section still prints; say so in the verdict rather than
-  guessing.
+- The scripts need network (npm registry / crates.io / PyPI / Docker Hub / GitHub API
+  / Go proxy + checksum db). If one can't fetch a version, its metadata section still
+  prints; say so in the verdict rather than guessing.
 - Idempotent: re-running on the same PR updates the existing comment in place.
