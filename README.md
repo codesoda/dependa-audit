@@ -1,53 +1,82 @@
 # dependa-audit
 
-A [Claude Code](https://docs.claude.com/en/docs/claude-code) skill that runs a
-**supply-chain audit of a Dependabot PR**. For every dependency the PR bumps —
-direct *and* transitive — it diffs the current version against the target version
-and surfaces anything sketchy: new install hooks, new dependencies, a changed
-publisher/maintainer, missing provenance, new network endpoints, or suspicious
-code. The expensive per-package work runs in **parallel Sonnet subagents (max 5
-concurrent)**, and the result is posted to the PR as inline findings on the
-changed dependency lines plus an idempotent summary comment (verdict table +
-written report) — the same report is also shown to you in the conversation.
+Switching on Dependabot is good practice. It files the version bumps and closes
+CVEs without anyone having to babysit a lockfile. The catch is that a Dependabot
+PR tells you a number went up; it says nothing about what changed inside the
+package. You're trusting that `1.2.3 → 1.2.4` is the same maintainer shipping the
+same kind of code they shipped last time.
 
-This is a **defensive security tool**. The goal is to catch a compromised or
-malicious dependency release *before it merges*. It is built to be skeptical, to
-cite evidence for every flag, and to never invent findings.
+Usually it is. When it isn't, the PR looks identical to a routine bump:
+
+- October 2021: an attacker took over the npm account behind
+  [`ua-parser-js`](https://www.bleepingcomputer.com/news/security/popular-npm-library-hijacked-to-install-password-stealers-miners/),
+  a parser pulled roughly 7 million times a week, and published three patch
+  releases (0.7.29, 0.8.0, 1.0.0) whose `preinstall` script fetched a Monero miner
+  and a password stealer the moment you ran `npm install`.
+- March 2025: a stolen token re-pointed every version tag of
+  [`tj-actions/changed-files`](https://www.wiz.io/blog/github-action-tj-actions-changed-files-supply-chain-attack-cve-2025-30066)
+  (v1 all the way through v45) at one malicious commit that dumped CI secrets into
+  the build log. It reached more than 23,000 repositories (CVE-2025-30066), and
+  anyone pinning the action by tag rather than commit SHA picked it up silently.
+
+Neither announced itself in the PR title. Both are the kind of thing a reviewer
+would catch given time to read the actual diff, the changelog, and the git history
+behind every package — which nobody has, which is the whole reason Dependabot is
+switched on in the first place.
+
+dependa-audit reads that diff for you. For every package a PR bumps, direct and
+transitive, it pulls both versions straight from the registry, compares them,
+checks the change against the upstream changelog and the git tag/SHA it claims to
+come from, and goes looking for the specific move each ecosystem gets attacked
+through: a new install hook on npm or PyPI, a moved tag on a GitHub Action, a
+`build.rs` on a crate, an `init()` or cgo block on a Go module. The heavy
+per-package work runs in parallel Sonnet subagents, five at a time. What comes
+back is a verdict on the PR: inline comments on the lines that bump a flagged
+package, plus one summary comment carrying a table and a written report. You get
+the same report in the conversation.
+
+It's a defensive tool. The job is to catch a compromised or malicious release
+before it merges, so it stays skeptical and cites a concrete fact for everything
+it flags; it won't manufacture findings to look busy.
 
 ## How it works
 
-1. **Resolve & gate the PR** — fetch it, stop if it's closed/merged, and confirm
-   the author is `app/dependabot`.
-2. **Build the upgrade work-list** — the manifest/lockfile diff is ground truth.
-   The PR body lists *direct* bumps but often omits transitive ones; the lockfile
-   shows everything that actually changes. Transitive bumps are exactly where a
-   malicious release hides, so they're included.
-3. **Form audit units** — one unit per package (monorepo packages that move in
-   lockstep to the same version may be grouped to save agents).
-4. **Fan out** — dispatch units in batches of ≤5 parallel Sonnet subagents. Each
-   runs the relevant bundled auditor, cross-checks the official changelog,
-   verifies any publisher/maintainer change, and returns a structured verdict.
-5. **Aggregate** — roll the unit verdicts into one recommendation for the PR.
-6. **Post the audit** — each non-clean unit gets an inline review comment anchored
-   to the line in the diff that declares its bump; the PR also gets one idempotent
-   summary comment (verdict table + report). Hidden markers
-   (`dependa-audit:finding:<pkg>` and `dependa-audit:summary`) let re-runs update
-   in place and skip unchanged findings rather than nagging.
+1. **Resolve and gate the PR.** Fetch it, stop if it's already closed or merged,
+   and confirm the author really is `app/dependabot`.
+2. **Build the upgrade work-list from the lockfile.** The PR body lists the direct
+   bumps and usually omits the transitive ones; the manifest/lockfile diff is
+   ground truth, so that's what gets parsed. Transitive releases are exactly where
+   a malicious version likes to hide, so they're in scope.
+3. **Form audit units.** One per package. Monorepo packages that move in lockstep
+   to the same version can share a unit to save agents.
+4. **Fan out.** Units run in batches of five parallel Sonnet subagents. Each runs
+   the right bundled auditor, reads the official changelog, confirms any publisher
+   or maintainer change, and returns a structured verdict.
+5. **Aggregate** the unit verdicts into a single recommendation for the PR.
+6. **Post the audit.** Every non-clean unit gets a review comment anchored to the
+   line in the diff that declares its bump, and the PR gets one idempotent summary
+   comment. Hidden markers (`dependa-audit:finding:<pkg>` and
+   `dependa-audit:summary`) let a re-run update its old comments in place instead
+   of stacking duplicates.
 
 ## Helper scripts
 
-Four bundled scripts in [`scripts/`](scripts/) do the per-ecosystem registry and
-tarball work. Each prints a **bounded, structured report** (no raw bundle dumps)
-ending with an INTERPRETATION GUIDE, and is designed to be read by a subagent.
+Six scripts in [`scripts/`](scripts/) do the per-ecosystem registry and archive
+work. Each prints a bounded, structured report (no raw bundle dumps) that ends in
+an INTERPRETATION GUIDE, written to be read by a subagent.
 
 | Script | Ecosystem | Key checks |
 |--------|-----------|------------|
 | [`npm-audit.sh`](scripts/npm-audit.sh) `<pkg> <from> <to>` | npm / pnpm | publisher + SLSA provenance, install lifecycle hooks, dependency diff, maintainers, network-endpoint diff, suspicious-pattern scan over added code, string-literal diff (catches minified bundles), file/size deltas |
 | [`crate-audit.sh`](scripts/crate-audit.sh) `<crate> <from> <to>` | Rust / cargo | `build.rs` add/change (the highest-risk Rust vector), proc-macro status, ownership, dependency diff, suspicious-pattern scan, embedded-payload heuristics |
-| [`python-audit.sh`](scripts/python-audit.sh) `<pkg> <from> <to>` | PyPI (pip/poetry/uv) | `setup.py` / build-backend install hooks (the highest-risk Python vector — runs on `pip install` from an sdist), PEP 740 provenance + Trusted-Publishing source repo, author/maintainer change, dependency diff, and sdist endpoint / suspicious-pattern / string-literal / embedded-payload scans |
-| [`docker-audit.sh`](scripts/docker-audit.sh) `<image> <from-digest> <to-digest> [tag]` | Docker Hub | **tag integrity** (does the new digest match what the registry serves for the tag?), entrypoint/cmd/user/env/label diff, layer-command history. Prints a `docker buildx imagetools inspect` fallback for non-Docker-Hub registries |
+| [`python-audit.sh`](scripts/python-audit.sh) `<pkg> <from> <to>` | PyPI (pip/poetry/uv) | `setup.py` / build-backend install hooks (these run on `pip install` from an sdist, the highest-risk Python vector), PEP 740 provenance + Trusted-Publishing source repo, author/maintainer change, dependency diff, plus sdist endpoint / suspicious-pattern / string-literal / embedded-payload scans |
+| [`docker-audit.sh`](scripts/docker-audit.sh) `<image> <from-digest> <to-digest> [tag]` | Docker Hub | **tag integrity** (does the new digest match what the registry serves for the tag?), entrypoint/cmd/user/env/label diff, layer-command history. Prints a `docker buildx imagetools inspect` fallback for other registries |
+| [`gha-audit.sh`](scripts/gha-audit.sh) `<owner/repo> <from-ref> <to-ref>` | GitHub Actions | **ref/tag integrity** (does the new SHA map to a real published tag, or did a tag move under you, as in the tj-actions case), `action.yml` execution-model change (node/docker/composite) and diff, env-injection into `$GITHUB_ENV`/`$GITHUB_PATH`, changed-file classification, known advisories |
+| [`go-audit.sh`](scripts/go-audit.sh) `<module> <from> <to>` | Go modules | checksum transparency-log presence (`sum.golang.org`) and VCS-origin/tag match, the surfaces Go actually runs code through (`init()`, cgo/`#cgo`, `//go:generate`, `//go:linkname`), `go.mod` require/replace diff, new network hosts, embedded-payload scan |
 
-All four use anonymous registry APIs — no daemon, no auth, no package install.
+npm, crate, python, docker, and go hit anonymous public registry APIs; gha-audit
+goes through your authenticated `gh` so it can read the Actions repo and its
+advisories. None of them installs a package, runs a build, or needs a daemon.
 
 ## Verdict levels
 
@@ -58,21 +87,23 @@ All four use anonymous registry APIs — no daemon, no auth, no package install.
 | 🟠 **SUSPICIOUS** | A real anomaly that needs a human to look before merge. |
 | 🔴 **BLOCK** | Evidence of a malicious or compromised release. |
 
-The PR-level recommendation is the worst single verdict: any BLOCK → *do not
-merge*; else any SUSPICIOUS → *hold for human review*; else any NOTE → *safe to
-merge (notes below)*; else *safe to merge*.
+The PR-level recommendation is the worst single verdict: any BLOCK means *do not
+merge*; otherwise any SUSPICIOUS means *hold for human review*; otherwise any NOTE
+means *safe to merge, notes below*; otherwise *safe to merge*.
 
 ## Installation
 
 Install it straight from GitHub with the [`skills`](https://github.com/vercel-labs/skills)
-CLI — any public repo with a `SKILL.md` at its root is a valid source, and this one is:
+CLI. Any public repo with a `SKILL.md` at its root is a valid source, and this one
+qualifies:
 
 ```sh
 npx skills add codesoda/dependa-audit
 ```
 
 That downloads the repo, detects the skill, and copies it into your agent's skills
-directory (Claude Code, Codex, Cursor, and 50+ others are supported). Manage it with:
+directory (Claude Code, Codex, Cursor, and 50+ others are supported). Manage it
+with:
 
 ```sh
 npx skills list                   # show installed skills
@@ -80,17 +111,18 @@ npx skills update dependa-audit   # pull the latest version
 npx skills remove dependa-audit   # uninstall
 ```
 
-The GitHub CLI's `gh skill` (v2.90+) reads the same Agent Skills format if you prefer
-a native tool — and can pin the install to a commit, which is worth doing for a
-security tool (a tag can move; a commit hash can't).
+The GitHub CLI's `gh skill` (v2.90+) reads the same Agent Skills format if you'd
+rather use a native tool. It can also pin the install to a commit, which is worth
+doing for a security tool: a tag can move, a commit hash can't. (That's not
+theoretical: moving a tag is exactly how the tj-actions attack above landed.)
 
-Claude Code discovers the skill through its `SKILL.md`, and the `allowed-tools` globs
-match the bundled scripts by their `/dependa-audit/scripts/...` path fragment, so the
-auditors run regardless of where the skill is installed.
+Claude Code discovers the skill through its `SKILL.md`, and the `allowed-tools`
+globs match the bundled scripts by their `/dependa-audit/scripts/...` path
+fragment, so the auditors run no matter where the skill ends up installed.
 
 ### Local development
 
-Working on the skill itself? `skills` accepts a local path, so install from a clone:
+Working on the skill itself? `skills` takes a local path, so install from a clone:
 
 ```sh
 git clone https://github.com/codesoda/dependa-audit
@@ -112,27 +144,33 @@ current branch if there is one. It audits **one PR per invocation**.
 
 ## Requirements
 
-- [`gh`](https://cli.github.com/) — authenticated; used for all GitHub I/O
-  (reading the PR, posting the comment).
-- `curl` and `jq` — used by all four scripts for registry I/O.
-- `npm` and `tar` — `npm-audit.sh` runs `npm pack`; `tar` extracts the npm, cargo,
-  and PyPI download archives. (`python-audit.sh` needs only `curl`/`jq`/`tar`.)
-- Network access to the relevant registries (npm registry, crates.io, PyPI, Docker Hub).
+- [`gh`](https://cli.github.com/), authenticated. It handles all GitHub I/O:
+  reading the PR, posting comments, and the Actions repo/advisory calls inside
+  `gha-audit.sh`.
+- `curl` and `jq` for the registry I/O every script does.
+- `npm` for the `npm pack` that `npm-audit.sh` runs.
+- `tar` to extract the npm, cargo, and PyPI archives. `go-audit.sh` wants `unzip`
+  (or `bsdtar`) instead, since Go modules ship as zips.
+- Network to whatever the audit touches: the npm registry, crates.io, PyPI, Docker
+  Hub, the GitHub API, and the Go proxy plus its checksum database.
 
-If a script can't fetch a version, its metadata section still prints and the
+When a script can't fetch a version, its metadata section still prints and the
 verdict says so rather than guessing.
 
 ## What it deliberately does *not* flag
 
-To stay useful, the audit avoids the false positives that burn reviewers:
-`process.env.TZ` reads and `function exec(){}` helpers are benign; minified
-single-line bundles make line-diffs noisy (the endpoint and string-literal diffs
-are trusted over raw line counts); 40–64-char hex strings in test fixtures are
-hashes/vectors, not payloads; documentation URLs are not exfiltration; and
-`provenance: NONE` is a weakness to *note*, not a reason to block. (For Python,
-`re.compile(...)`, doctest `>>>` lines, an HTTP library's own sockets/`urlopen`,
-and a `setup.py` that just reads its version file or moves to a `src/` layout are
-all expected.) A real finding is **new, unexplained, and runtime-reachable**.
+A tool that cries wolf gets turned off, so the audit swallows the false positives
+that burn reviewers. `process.env.TZ` reads and `function exec(){}` helpers are
+benign. Minified single-line bundles make line-diffs useless, so the endpoint and
+string-literal diffs are trusted over raw line counts. A 40–64-char hex string in
+a test fixture is a hash or vector, not a payload; a documentation URL is not
+exfiltration; `provenance: NONE` is a weakness worth a NOTE, not a block. For
+Python, `re.compile(...)`, doctest `>>>` lines, an HTTP library opening its own
+sockets, and a `setup.py` that just reads its version file or moves to a `src/`
+layout are all expected. A `node16→node20` runtime bump on a GitHub Action is
+housekeeping, and the hundreds of `unsafe`/asm/`//go:linkname` sites in a Go
+syscall package are that package doing its job. A real finding is **new,
+unexplained, and runtime-reachable**.
 
 ## Layout
 
@@ -144,5 +182,7 @@ all expected.) A real finding is **new, unexplained, and runtime-reachable**.
     ├── npm-audit.sh
     ├── crate-audit.sh
     ├── docker-audit.sh
-    └── python-audit.sh
+    ├── python-audit.sh
+    ├── gha-audit.sh
+    └── go-audit.sh
 ```
