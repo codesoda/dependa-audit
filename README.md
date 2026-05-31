@@ -64,16 +64,38 @@ merge (notes below)*; else *safe to merge*.
 
 ## Installation
 
-This repo is the canonical home of the skill. To make it available to Claude Code,
-symlink it into your skills directory so every repo can use it:
+Install it straight from GitHub with the [`skills`](https://github.com/vercel-labs/skills)
+CLI — any public repo with a `SKILL.md` at its root is a valid source, and this one is:
 
 ```sh
-ln -s "$PWD" ~/.skills/.agents/skills/dependa-audit
+npx skills add codesoda/dependa-audit
 ```
 
-Claude Code discovers the skill via its `SKILL.md`, and the `allowed-tools` globs
-match the scripts by the `/dependa-audit/scripts/...` path fragment, so the skill
-works the same whether it's reached through the symlink or directly.
+That downloads the repo, detects the skill, and copies it into your agent's skills
+directory (Claude Code, Codex, Cursor, and 50+ others are supported). Manage it with:
+
+```sh
+npx skills list                   # show installed skills
+npx skills update dependa-audit   # pull the latest version
+npx skills remove dependa-audit   # uninstall
+```
+
+The GitHub CLI's `gh skill` (v2.90+) reads the same Agent Skills format if you prefer
+a native tool — and can pin the install to a commit, which is worth doing for a
+security tool (a tag can move; a commit hash can't).
+
+Claude Code discovers the skill through its `SKILL.md`, and the `allowed-tools` globs
+match the bundled scripts by their `/dependa-audit/scripts/...` path fragment, so the
+auditors run regardless of where the skill is installed.
+
+### Local development
+
+Working on the skill itself? `skills` accepts a local path, so install from a clone:
+
+```sh
+git clone https://github.com/codesoda/dependa-audit
+npx skills add ./dependa-audit
+```
 
 ## Usage
 
