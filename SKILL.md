@@ -13,6 +13,7 @@ allowed-tools:
   - Bash(*/dependa-audit/scripts/crate-audit.sh*)
   - Bash(*/dependa-audit/scripts/docker-audit.sh*)
   - Bash(*/dependa-audit/scripts/python-audit.sh*)
+  - Bash(*/dependa-audit/scripts/gha-audit.sh*)
   - Bash(curl:*)
   - Bash(npm pack:*)
   - Bash(npm view:*)
@@ -39,7 +40,7 @@ if there is one). Audit **one PR per invocation**.
 
 ## Helper scripts
 
-Four bundled scripts live in `scripts/` next to this SKILL.md. Resolve their
+Five bundled scripts live in `scripts/` next to this SKILL.md. Resolve their
 **absolute paths** (the directory this SKILL.md was loaded from) and pass them to
 each subagent. Each prints a bounded, structured report and ends with an
 INTERPRETATION GUIDE.
@@ -53,6 +54,10 @@ INTERPRETATION GUIDE.
 - `scripts/python-audit.sh <package> <from> <to>` — PyPI packages (pip/poetry/uv).
   Surfaces `setup.py`/build-backend install hooks, PEP 740 provenance (Trusted
   Publishing) with its source repo, dependency/author changes, and an sdist code diff.
+- `scripts/gha-audit.sh <owner/repo> <from-ref> <to-ref>` — GitHub Actions (refs may
+  be tags or SHAs). Verifies ref/tag integrity (does the new commit map to a real
+  published tag?), owner/archived status, the `action.yml` execution model + diff,
+  changed-file classification, and known advisories. Uses the GitHub API (`gh`).
 
 ## Steps
 
@@ -73,6 +78,8 @@ Make a todo list first.
    - docker: `Dockerfile*` / `*.yml` image digests or tags
    - pypi: `pyproject.toml` / `requirements*.txt` / `setup.py` + lock (`poetry.lock`,
      `uv.lock`, `Pipfile.lock`, `pdm.lock`)
+   - github-actions: `.github/workflows/*.yml` (and `action.yml`) `uses: owner/repo@ref`
+     pins — the bumped `ref` is a tag or commit SHA, usually with a `# vX` comment
    Include transitive bumps — those are exactly where a malicious release hides.
 
 3. **Form audit units.** One unit per package. You MAY group packages from the
@@ -89,7 +96,7 @@ Make a todo list first.
    general-purpose`. Give each subagent this brief (filled in for its unit):
 
    > You are auditing a dependency upgrade in a Dependabot PR for supply-chain
-   > risk. Package(s): `<names>`. Ecosystem: `<npm|cargo|docker|pypi>`. Versions:
+   > risk. Package(s): `<names>`. Ecosystem: `<npm|cargo|docker|pypi|gha>`. Versions:
    > `<from>` → `<to>`.
    >
    > a. Run the bundled auditor and read its full output:
@@ -97,6 +104,7 @@ Make a todo list first.
    >    - cargo:  `<abs>/scripts/crate-audit.sh <crate> <from> <to>`
    >    - docker: `<abs>/scripts/docker-audit.sh <image> <from-digest> <to-digest> <tag>`
    >    - pypi:   `<abs>/scripts/python-audit.sh <pkg> <from> <to>`
+   >    - gha:    `<abs>/scripts/gha-audit.sh <owner/repo> <from-ref> <to-ref>`
    >    (For a monorepo group, run it once per package.)
    > b. Cross-check the **official changelog/release notes** for this exact version
    >    range (the package's GitHub releases/CHANGELOG via `gh release`/WebFetch).
@@ -115,6 +123,15 @@ Make a todo list first.
    >    pointing at unexpected hosts, a base-image major jump, or a source-label
    >    change. (Non-Docker-Hub registry → use the `docker buildx imagetools
    >    inspect` fallback the script prints.)
+   > e. (github-actions only) Run `gha-audit.sh <owner/repo> <from-ref> <to-ref>` with
+   >    the old/new pins from the `uses:` line. The key check is REF/TAG INTEGRITY —
+   >    the new commit SHA must map to a real published tag matching Dependabot's
+   >    `# vX` comment; an untagged or moved-tag pin is a flag. Also flag an
+   >    execution-model change (node↔docker↔composite), a new `image: docker://`
+   >    external container, an added pre/post hook, env-injection (writes to
+   >    `$GITHUB_ENV`/`$GITHUB_PATH`, `::set-env`), or secret reads paired with new
+   >    network egress. If the script lists an advisory, check whether the upgrade
+   >    crosses its fix — that is a reason to merge, not to block.
    >
    > Apply this judgment (do not over-flag — these are the false positives that
    > burned a prior reviewer): `process.env.TZ` reads and `function exec(){}`
@@ -127,12 +144,15 @@ Make a todo list first.
    > reads `__version__.py` or moves to a `src/` layout is benign — flag a setup.py
    > doing network/subprocess/exec or reading credentials; `os.environ` config reads
    > and `.netrc`/`pickle` inside a library's own auth/serialization code are not
-   > exfiltration. A real finding is NEW, unexplained, and runtime-reachable.
+   > exfiltration. (GitHub Actions) big `node_modules`/`dist` churn and the action's
+   > own `GITHUB_TOKEN`/GitHub-API use are expected, and a `node16→node20` runtime
+   > bump is routine — flag new EXTERNAL egress, env-injection, or a SHA no tag points
+   > at. A real finding is NEW, unexplained, and runtime-reachable.
    >
    > Return ONLY this structure, no prose around it:
    > ```
    > UNIT: <package(s)>
-   > ECOSYSTEM: <npm|cargo|docker|pypi>
+   > ECOSYSTEM: <npm|cargo|docker|pypi|gha>
    > VERSIONS: <from> -> <to>   (<direct|transitive>)
    > VERDICT: CLEAN | NOTE | SUSPICIOUS | BLOCK
    > install_hooks: <none | details>
@@ -267,7 +287,7 @@ a teammate.
 - Trust the scripts' endpoint/string-literal diffs over raw line counts on minified
   bundles. When a signal is ambiguous, prefer NOTE/SUSPICIOUS over silently
   dropping it — but back every flag with a concrete, verifiable fact.
-- The scripts need network (npm registry / crates.io / PyPI / Docker Hub). If one can't fetch a
+- The scripts need network (npm registry / crates.io / PyPI / Docker Hub / GitHub API). If one can't fetch a
   version, its metadata section still prints; say so in the verdict rather than
   guessing.
 - Idempotent: re-running on the same PR updates the existing comment in place.
