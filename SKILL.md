@@ -12,6 +12,7 @@ allowed-tools:
   - Bash(*/dependa-audit/scripts/npm-audit.sh*)
   - Bash(*/dependa-audit/scripts/crate-audit.sh*)
   - Bash(*/dependa-audit/scripts/docker-audit.sh*)
+  - Bash(*/dependa-audit/scripts/python-audit.sh*)
   - Bash(curl:*)
   - Bash(npm pack:*)
   - Bash(npm view:*)
@@ -38,7 +39,7 @@ if there is one). Audit **one PR per invocation**.
 
 ## Helper scripts
 
-Three bundled scripts live in `scripts/` next to this SKILL.md. Resolve their
+Four bundled scripts live in `scripts/` next to this SKILL.md. Resolve their
 **absolute paths** (the directory this SKILL.md was loaded from) and pass them to
 each subagent. Each prints a bounded, structured report and ends with an
 INTERPRETATION GUIDE.
@@ -49,6 +50,9 @@ INTERPRETATION GUIDE.
   images (anonymous registry API; verifies the new digest matches the live tag,
   diffs entrypoint/cmd/user/env/labels and layer history). For non-Docker-Hub
   registries it prints a `docker buildx imagetools inspect` fallback.
+- `scripts/python-audit.sh <package> <from> <to>` — PyPI packages (pip/poetry/uv).
+  Surfaces `setup.py`/build-backend install hooks, PEP 740 provenance (Trusted
+  Publishing) with its source repo, dependency/author changes, and an sdist code diff.
 
 ## Steps
 
@@ -67,6 +71,8 @@ Make a todo list first.
    - npm/pnpm: `package.json` + `pnpm-lock.yaml` (or `package-lock.yaml`)
    - cargo: `Cargo.toml` + `Cargo.lock`
    - docker: `Dockerfile*` / `*.yml` image digests or tags
+   - pypi: `pyproject.toml` / `requirements*.txt` / `setup.py` + lock (`poetry.lock`,
+     `uv.lock`, `Pipfile.lock`, `pdm.lock`)
    Include transitive bumps — those are exactly where a malicious release hides.
 
 3. **Form audit units.** One unit per package. You MAY group packages from the
@@ -83,13 +89,14 @@ Make a todo list first.
    general-purpose`. Give each subagent this brief (filled in for its unit):
 
    > You are auditing a dependency upgrade in a Dependabot PR for supply-chain
-   > risk. Package(s): `<names>`. Ecosystem: `<npm|cargo|docker>`. Versions:
+   > risk. Package(s): `<names>`. Ecosystem: `<npm|cargo|docker|pypi>`. Versions:
    > `<from>` → `<to>`.
    >
    > a. Run the bundled auditor and read its full output:
    >    - npm:    `<abs>/scripts/npm-audit.sh <pkg> <from> <to>`
    >    - cargo:  `<abs>/scripts/crate-audit.sh <crate> <from> <to>`
    >    - docker: `<abs>/scripts/docker-audit.sh <image> <from-digest> <to-digest> <tag>`
+   >    - pypi:   `<abs>/scripts/python-audit.sh <pkg> <from> <to>`
    >    (For a monorepo group, run it once per package.)
    > b. Cross-check the **official changelog/release notes** for this exact version
    >    range (the package's GitHub releases/CHANGELOG via `gh release`/WebFetch).
@@ -116,13 +123,16 @@ Make a todo list first.
    > 40–64-char hex strings in test fixtures are hashes/vectors, not payloads;
    > documentation URLs (the package's own site, MDN) are not exfiltration;
    > `provenance: NONE` is a weakness to NOTE, not a reason to block; an HTTP
-   > client inside an HTTP library is expected. A real finding is NEW, unexplained,
-   > and runtime-reachable.
+   > client inside an HTTP library is expected. (Python) a `setup.py` that only
+   > reads `__version__.py` or moves to a `src/` layout is benign — flag a setup.py
+   > doing network/subprocess/exec or reading credentials; `os.environ` config reads
+   > and `.netrc`/`pickle` inside a library's own auth/serialization code are not
+   > exfiltration. A real finding is NEW, unexplained, and runtime-reachable.
    >
    > Return ONLY this structure, no prose around it:
    > ```
    > UNIT: <package(s)>
-   > ECOSYSTEM: <npm|cargo|docker>
+   > ECOSYSTEM: <npm|cargo|docker|pypi>
    > VERSIONS: <from> -> <to>   (<direct|transitive>)
    > VERDICT: CLEAN | NOTE | SUSPICIOUS | BLOCK
    > install_hooks: <none | details>
@@ -257,7 +267,7 @@ a teammate.
 - Trust the scripts' endpoint/string-literal diffs over raw line counts on minified
   bundles. When a signal is ambiguous, prefer NOTE/SUSPICIOUS over silently
   dropping it — but back every flag with a concrete, verifiable fact.
-- The scripts need network (npm registry / crates.io). If one can't fetch a
+- The scripts need network (npm registry / crates.io / PyPI / Docker Hub). If one can't fetch a
   version, its metadata section still prints; say so in the verdict rather than
   guessing.
 - Idempotent: re-running on the same PR updates the existing comment in place.

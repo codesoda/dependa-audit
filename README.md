@@ -36,7 +36,7 @@ cite evidence for every flag, and to never invent findings.
 
 ## Helper scripts
 
-Three bundled scripts in [`scripts/`](scripts/) do the per-ecosystem registry and
+Four bundled scripts in [`scripts/`](scripts/) do the per-ecosystem registry and
 tarball work. Each prints a **bounded, structured report** (no raw bundle dumps)
 ending with an INTERPRETATION GUIDE, and is designed to be read by a subagent.
 
@@ -44,9 +44,10 @@ ending with an INTERPRETATION GUIDE, and is designed to be read by a subagent.
 |--------|-----------|------------|
 | [`npm-audit.sh`](scripts/npm-audit.sh) `<pkg> <from> <to>` | npm / pnpm | publisher + SLSA provenance, install lifecycle hooks, dependency diff, maintainers, network-endpoint diff, suspicious-pattern scan over added code, string-literal diff (catches minified bundles), file/size deltas |
 | [`crate-audit.sh`](scripts/crate-audit.sh) `<crate> <from> <to>` | Rust / cargo | `build.rs` add/change (the highest-risk Rust vector), proc-macro status, ownership, dependency diff, suspicious-pattern scan, embedded-payload heuristics |
+| [`python-audit.sh`](scripts/python-audit.sh) `<pkg> <from> <to>` | PyPI (pip/poetry/uv) | `setup.py` / build-backend install hooks (the highest-risk Python vector — runs on `pip install` from an sdist), PEP 740 provenance + Trusted-Publishing source repo, author/maintainer change, dependency diff, and sdist endpoint / suspicious-pattern / string-literal / embedded-payload scans |
 | [`docker-audit.sh`](scripts/docker-audit.sh) `<image> <from-digest> <to-digest> [tag]` | Docker Hub | **tag integrity** (does the new digest match what the registry serves for the tag?), entrypoint/cmd/user/env/label diff, layer-command history. Prints a `docker buildx imagetools inspect` fallback for non-Docker-Hub registries |
 
-All three use anonymous registry APIs — no daemon, no auth, no package install.
+All four use anonymous registry APIs — no daemon, no auth, no package install.
 
 ## Verdict levels
 
@@ -91,9 +92,10 @@ current branch if there is one. It audits **one PR per invocation**.
 
 - [`gh`](https://cli.github.com/) — authenticated; used for all GitHub I/O
   (reading the PR, posting the comment).
-- `curl` and `jq` — used by all three scripts for registry I/O.
-- `npm` and `tar` — used by `npm-audit.sh` to pack and extract package tarballs.
-- Network access to the relevant registries (npm registry, crates.io, Docker Hub).
+- `curl` and `jq` — used by all four scripts for registry I/O.
+- `npm` and `tar` — `npm-audit.sh` runs `npm pack`; `tar` extracts the npm, cargo,
+  and PyPI download archives. (`python-audit.sh` needs only `curl`/`jq`/`tar`.)
+- Network access to the relevant registries (npm registry, crates.io, PyPI, Docker Hub).
 
 If a script can't fetch a version, its metadata section still prints and the
 verdict says so rather than guessing.
@@ -105,8 +107,10 @@ To stay useful, the audit avoids the false positives that burn reviewers:
 single-line bundles make line-diffs noisy (the endpoint and string-literal diffs
 are trusted over raw line counts); 40–64-char hex strings in test fixtures are
 hashes/vectors, not payloads; documentation URLs are not exfiltration; and
-`provenance: NONE` is a weakness to *note*, not a reason to block. A real finding
-is **new, unexplained, and runtime-reachable**.
+`provenance: NONE` is a weakness to *note*, not a reason to block. (For Python,
+`re.compile(...)`, doctest `>>>` lines, an HTTP library's own sockets/`urlopen`,
+and a `setup.py` that just reads its version file or moves to a `src/` layout are
+all expected.) A real finding is **new, unexplained, and runtime-reachable**.
 
 ## Layout
 
@@ -117,5 +121,6 @@ is **new, unexplained, and runtime-reachable**.
 └── scripts/
     ├── npm-audit.sh
     ├── crate-audit.sh
-    └── docker-audit.sh
+    ├── docker-audit.sh
+    └── python-audit.sh
 ```
