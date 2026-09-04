@@ -1,6 +1,6 @@
 ---
 name: dependa-audit
-description: Supply-chain audit of a Dependabot PR. For every dependency the PR bumps, diff the current vs target version (install hooks, new deps, publisher/provenance, network endpoints, code) using parallel Sonnet subagents, then post a PR comment with a verdict table + text report. Use when reviewing a Dependabot PR for anything sketchy in the dependency updates.
+description: Supply-chain and CI/build suitability audit of a Dependabot PR. For every dependency the PR bumps, diff the current vs target version for supply-chain risk, then review version alignment, build-image/toolchain compatibility, PR-history decisions, and existing CI coverage using parallel Sonnet subagents. Post a PR comment with both verdicts and a written report.
 allowed-tools:
   - Bash(gh pr view:*)
   - Bash(gh pr list:*)
@@ -15,20 +15,27 @@ allowed-tools:
   - Bash(*/dependa-audit/scripts/python-audit.sh*)
   - Bash(*/dependa-audit/scripts/gha-audit.sh*)
   - Bash(*/dependa-audit/scripts/go-audit.sh*)
+  - Bash(*/dependa-audit/scripts/suitability-audit.sh*)
   - Bash(curl:*)
   - Bash(npm pack:*)
   - Bash(npm view:*)
   - Bash(jq:*)
 ---
 
-# dependa-audit — supply-chain review of a Dependabot PR
+# dependa-audit — supply-chain and CI/build suitability review of a Dependabot PR
 
 Audit every dependency a Dependabot PR upgrades. For each package, diff the
 **current version against the target version** and surface anything sketchy:
 new install hooks, new dependencies, changed publisher/maintainer, missing
-provenance, new network endpoints, or suspicious code. The expensive per-package
-work runs in **parallel Sonnet subagents (max 5 concurrent)**. The result is a PR
-comment with a verdict table + text report, plus the same report shown to the user.
+provenance, new network endpoints, or suspicious code. Separately review whether
+the proposed change is suitable for this repository's build and CI contracts:
+version skew between CI, toolchain declarations, Docker images, package managers,
+and release paths; human decisions or reverted updates in the PR history; and
+compatibility checks not covered by existing test scenarios. This is a focused
+static suitability review, not a replacement for full API or desktop regression
+coverage. The expensive work runs in **parallel Sonnet subagents (max 5 concurrent)**.
+The result is a PR comment with security and suitability verdicts plus a written
+report, and the same report shown to the user.
 
 This is a defensive security task: the goal is to catch a compromised or malicious
 dependency release before it merges. Be skeptical, cite evidence, never invent findings.
@@ -41,7 +48,7 @@ if there is one). Audit **one PR per invocation**.
 
 ## Helper scripts
 
-Six bundled scripts live in `scripts/` next to this SKILL.md. Resolve their
+Seven bundled scripts live in `scripts/` next to this SKILL.md. Resolve their
 **absolute paths** (the directory this SKILL.md was loaded from) and pass them to
 each subagent. Each prints a bounded, structured report and ends with an
 INTERPRETATION GUIDE.
@@ -65,15 +72,23 @@ INTERPRETATION GUIDE.
   actually has — `init()`, cgo/`#cgo`, `//go:generate`, `//go:linkname` — plus
   `go.mod` `require`/`replace` changes and new network hosts. Uses the Go proxy
   (`proxy.golang.org`); no build, no `go` toolchain required.
+- `scripts/suitability-audit.sh <pr> [owner/repo]` — read-only repository-context
+  review. Reconstructs the initial Dependabot change versus the final head,
+  surfaces human/reverted dependency decisions, inventories CI/toolchain/image
+  pins, and reports nearby test-contract coverage. It does not checkout, build,
+  or run the target project's tests.
 
 ## Steps
 
 Make a todo list first.
 
 1. **Resolve & gate the PR.** Use a Haiku agent to fetch the PR (`gh pr view <n>
-   --json state,isDraft,author,title,body,headRefName,url`). Stop if it is closed
-   or merged. Confirm the author is `app/dependabot` (if not, tell the user this
-   isn't a Dependabot PR and ask whether to continue). Draft is fine.
+   --json state,isDraft,author,title,body,baseRefName,baseRefOid,headRefName,
+   headRefOid,commits,url`). Stop if it is closed or merged. Confirm the author is
+   `app/dependabot` (if not, tell the user this isn't a Dependabot PR and ask
+   whether to continue). Draft is fine. The suitability helper may be run against
+   a closed/merged PR for regression validation, but that is not an audit posting
+   bypass.
 
 2. **Build the upgrade work-list — the manifest/lockfile diff is ground truth.**
    The PR body table lists *direct* bumps but often omits transitive ones; the
@@ -91,14 +106,30 @@ Make a todo list first.
      `go.sum` has two hashes per module (`<module> <v>` and `<module> <v>/go.mod`)
    Include transitive bumps — those are exactly where a malicious release hides.
 
-3. **Form audit units.** One unit per package. You MAY group packages from the
-   same monorepo that move in lockstep to the same version (e.g. all `@statsig/*`
-   3.33.0→3.33.1, or all `@typescript-eslint/*`) into a single unit to save
-   agents — but never group unrelated packages. Each unit names its ecosystem.
+3. **Reconstruct the PR decision history and context.** Run the bundled
+   suitability auditor once for the PR:
+   `/absolute/path/to/dependa-audit/scripts/suitability-audit.sh <pr> <owner/repo>`.
+   Read its full output. It compares the first Dependabot commit with the final
+   head, so a human-reverted image or toolchain bump cannot disappear merely
+   because it is absent from the final net diff. Treat a reverted update as a
+   reviewed decision (not a final package to audit) and preserve its rationale,
+   final value, and compatibility implications in the suitability report.
 
-4. **Make a todo entry per unit** so progress is visible.
+4. **Form supply-chain audit units.** One unit per package. You MAY group packages
+   from the same monorepo that move in lockstep to the same version (e.g. all
+   `@statsig/*` 3.33.0→3.33.1, or all `@typescript-eslint/*`) into a single unit
+   to save agents — but never group unrelated packages. Each unit names its
+   ecosystem.
 
-5. **Fan out — parallel Sonnet subagents, at most 5 running at once.** Dispatch
+5. **Form one CI/build suitability unit per PR** in addition to the package
+   units. It covers the related version matrix and build/release paths, not a
+   second full package diff. Include it even when a proposed dependency update
+   was reverted or the final diff contains only a test assertion.
+
+6. **Make a todo entry per supply-chain and suitability unit** so progress is
+   visible.
+
+7. **Fan out — parallel Sonnet subagents, at most 5 running at once.** Dispatch
    units in batches of ≤5 (multiple Agent calls in one message = concurrent), wait
    for the batch, then dispatch the next, until all units are done. Every audit
    subagent uses model **sonnet** (the latest Sonnet) and `subagent_type:
@@ -189,20 +220,75 @@ Make a todo list first.
    > note: <one line for the report, or empty>
    > ```
 
-   **Verdict meaning:** CLEAN = nothing notable. NOTE = safe to merge but the team
-   should know something (e.g. publisher moved to a new owner, no provenance on a
-   data-collecting SDK). SUSPICIOUS = a real anomaly that needs a human to look
-   before merge. BLOCK = evidence of a malicious/compromised release.
+   **Suitability review (one per PR).** In a separate Sonnet agent, run
+   `/absolute/path/to/dependa-audit/scripts/suitability-audit.sh <pr> <owner/repo>`
+   and read its full output. This is a static CI/build review, not a second package
+   security scan and not a full application regression. Check all of the following:
 
-6. **Aggregate.** Collect all unit verdicts. The PR's overall recommendation:
+   - Compare the initial Dependabot commit, the final net diff, later human commits,
+     and review/comment rationale. A dependency or image update that was reverted
+     must remain visible as a decision with its proposed value, final value, and
+     explanation; do not silently drop it because it is absent from the final diff.
+   - Build a version matrix across changed and related paths: `rust-toolchain.toml`,
+     `Cargo.toml` `rust-version`, CI toolchain actions and environment variables,
+     Docker `FROM` images and build args, Node/npm/pnpm pins, package `engines` and
+     `packageManager`, GitHub Action runtimes, Terraform/deployment image tags,
+     and release/build scripts. Compare the role and scope of each pin, not only
+     literal equality.
+   - Evaluate compiler/MSRV and target/ABI compatibility, builder-versus-runtime
+     image compatibility, native-module/runtime compatibility, architecture/base-OS
+     changes, floating versus immutable tags, and whether the changed version is
+     used in production, release, or CI-only paths. Verify official compatibility
+     claims when the matrix or release notes requires it.
+   - Inventory existing CI/test contracts for each signal. Identify the exact test
+     or job that covers it, whether it actually exercises the affected build/image,
+     and any uncovered cross-document invariant. Lack of a test is a coverage gap
+     to report, not proof that the dependency is broken.
+   - Treat a major/minor toolchain or runtime mismatch, an unsupported engine/MSRV,
+     an unexplained reverted decision, or a changed production build path without
+     suitable coverage as `CONCERN`. Treat an explained decision, an acceptable
+     patch-level drift, or a known uncovered-but-low-risk invariant as `NOTE`.
+     Use `CLEAR` only when the relevant relationships are either aligned or
+     explicitly justified and covered. Do not call a compatibility issue
+     `SUSPICIOUS` or `BLOCK` without separate supply-chain evidence.
+
+   Return only this structure:
+   ```
+   SUITABILITY_UNIT: CI/build compatibility for <repo>#<pr>
+   SUITABILITY_VERDICT: CLEAR | NOTE | CONCERN
+   version_matrix: <relevant declarations and observed values>
+   history_decisions: <proposed/reverted changes, rationale, or none>
+   compatibility_signals: <signals and why they are acceptable or concerning>
+   coverage: <covered | partial | not covered — paths/jobs and gaps>
+   evidence: <the 1–3 concrete facts supporting the verdict, with sources>
+   note: <one line for the report, or empty>
+   ```
+
+   **Supply-chain verdict meaning:** CLEAN = nothing notable. NOTE = safe to merge
+   but the team should know something (e.g. publisher moved to a new owner, no
+   provenance on a data-collecting SDK). SUSPICIOUS = a real anomaly that needs a
+   human to look before merge. BLOCK = evidence of a malicious/compromised release.
+
+8. **Aggregate.** Collect all supply-chain and suitability results separately.
+   The security recommendation remains:
    - any BLOCK → **Do not merge — investigate.**
    - else any SUSPICIOUS → **Hold for human review.**
-   - else any NOTE → **Safe to merge (notes below).**
+   - else any NOTE → **Safe to merge (security notes below).**
    - else → **Safe to merge.**
 
-7. **Re-confirm** the PR is still open (Haiku agent) before posting.
+   Then apply the suitability result without conflating it with compromise:
+   - `CONCERN` → **Hold for human review** until the compatibility issue is
+     resolved or explicitly accepted by an owner.
+   - `NOTE` → retain **Safe to merge**, but include the version skew, decision
+     rationale, and coverage gap in the report.
+   - `CLEAR` → no suitability qualification.
+   The overall recommendation is the stricter of these two tracks. A missing
+   compatibility test alone is not a security finding and must not become
+   `SUSPICIOUS` or `BLOCK`.
 
-8. **Post the audit — anchored review comments for findings + an idempotent
+9. **Re-confirm** the PR is still open (Haiku agent) before posting.
+
+10. **Post the audit — anchored review comments for findings + an idempotent
    summary** (mirrors pr-code-review: things needing attention thread inline under
    "Files changed"; the overview is a separate summary comment).
 
@@ -216,31 +302,35 @@ Make a todo list first.
       that crate's `name = "<crate>"` block. For docker, the changed `FROM …` line.
       `line` is the new-file (RIGHT-side) line number and must fall inside a hunk.
 
-   b. **Inline finding comment for every NON-CLEAN unit** (NOTE / SUSPICIOUS /
-      BLOCK). A CLEAN unit is not a finding — it appears only in the summary table,
-      exactly as pr-code-review does not comment on clean code. Post each as a review
-      comment anchored to its line:
+   b. **Inline finding comment for every non-CLEAN security unit** (NOTE /
+      SUSPICIOUS / BLOCK) and every non-CLEAR suitability unit (NOTE / CONCERN).
+      A CLEAN security unit with CLEAR suitability is not a finding — it appears
+      only in the summary table. Anchor each finding to the changed line that
+      declares the relevant bump when possible:
       `gh api -X POST /repos/{owner}/{repo}/pulls/{n}/comments -f commit_id=<sha>
-      -f path=<path> -F line=<line> -f side=RIGHT -f body=<finding>` (finding body =
-      the per-unit format below, ending with `<!-- dependa-audit:finding:{package} -->`).
-      If a unit's line cannot be resolved, fall back to a top-level issue comment for
-      that finding.
+      -f path=<path> -F line=<line> -f side=RIGHT -f body=<finding>`.
+      Use the security or suitability finding format below and its matching hidden
+      marker. If a suitability decision was reverted and has no final changed line,
+      use a top-level issue comment or the summary's compatibility section rather
+      than inventing an invalid anchor.
 
    c. **Idempotency.** Before posting, fetch existing review comments
-      (`gh api /repos/{owner}/{repo}/pulls/{n}/comments`) and match by the
-      `dependa-audit:finding:{package}` marker. If a prior finding for the same unit
-      exists with an unchanged verdict → skip (don't nag). If the verdict changed →
-      post a fresh comment stating what changed at the new head sha. If a unit is now
-      CLEAN but had a prior non-CLEAN finding → reply on that thread that it's resolved.
+      (`gh api /repos/{owner}/{repo}/pulls/{n}/comments`) and match security findings
+      by `dependa-audit:finding:{package}` and suitability findings by
+      `dependa-audit:suitability:{scope}`. If a prior result has the same verdict,
+      skip it. If the verdict changed, post a fresh comment stating what changed at
+      the new head sha. If a result returns to CLEAN/CLEAR, reply on the prior
+      thread that it is resolved. Re-runs must not stack duplicate findings.
 
-   d. **Summary comment (always, even all-CLEAN).** Search issue comments for
+   d. **Summary comment (always, even all-CLEAN/CLEAR).** Search issue comments for
       `<!-- dependa-audit:summary -->`. PATCH it if present
       (`gh api -X PATCH /repos/{owner}/{repo}/issues/comments/{id} -f body=…`), else
-      POST a new one (`gh pr comment <n> --body-file …`). Body = the table + text
-      report (format below), ending with the marker; link each non-CLEAN unit to its
-      inline finding comment. Re-runs update the summary in place.
+      POST a new one (`gh pr comment <n> --body-file …`). Body = the security table,
+      suitability status/version matrix, coverage gaps, and text report (format
+      below), ending with the marker. Link each non-clean/non-clear unit to its
+      inline finding comment when one exists. Re-runs update the summary in place.
 
-9. **Show the user** the same text report in the conversation, and link the PR
+11. **Show the user** the same text report in the conversation, and link the PR
    comment(s).
 
 ## Finding comment format (inline, anchored to the dependency's diff line)
@@ -265,6 +355,24 @@ Publisher moved to `sdk.dev@amplitude.com` (Amplitude's [May 2026 Statsig takeov
 <!-- dependa-audit:finding:@statsig -->
 ```
 
+## Suitability finding comment format
+
+For a non-CLEAR compatibility result, use a separate marker so a compatibility
+note is not confused with a supply-chain finding:
+
+```
+**[<emoji> SUITABILITY <CLEAR|NOTE|CONCERN>] <scope>**
+
+<1–3 lines: the version relationship or human decision, why it is acceptable or
+concerning, which existing CI/test contract covers it, and the recommendation.>
+
+<sub>`dependa-audit` · compatibility review</sub>
+<!-- dependa-audit:suitability:<scope> -->
+```
+
+Use 🟡 for `NOTE` and 🟠 for `CONCERN`. A reverted-only decision with no final
+changed line may be a top-level issue comment instead of an inline review comment.
+
 ## Summary comment body format
 
 ````
@@ -272,12 +380,24 @@ Publisher moved to `sdk.dev@amplitude.com` (Amplitude's [May 2026 Statsig takeov
 
 Audited <N> package(s) upgraded by this PR. Each was checked for install hooks,
 dependency changes, publisher/provenance, network endpoints, and code diff.
+The separate CI/build suitability review checked PR-history decisions, related
+version pins, compatibility signals, and existing test coverage.
 
-| Package | From → To | Eco | Hooks | New deps | Provenance | Publisher Δ | Verdict |
-|---------|-----------|-----|-------|----------|-----------|-------------|---------|
+| Package | From → To | Eco | Hooks | New deps | Provenance | Publisher Δ | Security |
+|---------|-----------|-----|-------|----------|-------------|-------------|----------|
 | `@base-ui/react` | 1.4.1 → 1.5.0 | npm | none | none | SLSA v1 | no | ✅ CLEAN |
 | `@statsig/*` (4) | 3.33.0 → 3.33.1 | npm | none | none | none | ⚠️ acq. | 🟡 NOTE |
-| … | | | | | | | |
+| … | | | | | | | | |
+
+### CI/build suitability
+
+| Scope | Suitability | Version relationship / decision | Coverage |
+|-------|-------------|----------------------------------|----------|
+| CI/build toolchain | CLEAR | aligned or explicitly justified | covered |
+| … | NOTE/CONCERN | <short signal> | partial/not covered |
+
+<Include reverted decisions, relevant pins, and uncovered invariants here even
+when they have no final diff anchor.>
 
 ### Summary
 
@@ -287,26 +407,31 @@ packages publish with SLSA provenance". State the reassuring negatives explicitl
 
 ### Worth knowing
 
-<Only if any NOTE/SUSPICIOUS/BLOCK units exist. One short paragraph per notable
-unit: what it is, why it's flagged, and the recommendation. Cite sources
-(release notes, acquisition news, the specific signal). If everything is CLEAN,
-write "Nothing notable — safe to merge.">
+<Include one short paragraph for every security NOTE/SUSPICIOUS/BLOCK or
+suitability NOTE/CONCERN: what it is, why it is flagged, the existing coverage,
+and the recommendation. Cite sources (release notes, acquisition news, PR
+history, or the specific CI/build path). If all security units are CLEAN and
+suitability is CLEAR, write "Nothing notable — safe to merge.">
 
 <!-- dependa-audit:summary -->
 ````
 
-Verdict emoji: ✅ CLEAN, 🟡 NOTE, 🟠 SUSPICIOUS, 🔴 BLOCK. Keep the table compact
+Security verdict emoji: ✅ CLEAN, 🟡 NOTE, 🟠 SUSPICIOUS, 🔴 BLOCK. Suitability
+uses ✅ CLEAR, 🟡 NOTE, and 🟠 CONCERN. Keep the security table compact
 (abbreviate publisher-change as "no" / "⚠️ <reason>"). The text report shown to the
-user in the conversation is the same Summary + Worth-knowing content, led by the
-overall recommendation — written in plain prose like a security reviewer briefing
-a teammate.
+user in the conversation is the same Summary + CI/build suitability + Worth-knowing
+content, led by the overall recommendation — written in plain prose like a security
+reviewer briefing a teammate.
 
 ## Notes
 
 - **Parallelism is capped at 5** concurrent subagents; audit model is the **latest
-  Sonnet**. Cheap orchestration fetches (steps 1, 2, 7) may use Haiku.
-- Use `gh` for all GitHub I/O; the bundled scripts handle registry I/O.
-- Do not run the project's own build/tests, and do not modify the PR or repo.
+  Sonnet**. Cheap orchestration fetches (steps 1, 2, 3, 9) may use Haiku.
+- Use `gh` for all GitHub I/O; the bundled scripts handle registry and read-only
+  repository-context I/O.
+- Do not run the project's own build/tests, checkout its PR branch, or modify the
+  target PR/repository. The suitability pass inventories existing CI/test coverage;
+  it does not replace or execute full API/desktop regression scenarios.
 - Trust the scripts' endpoint/string-literal diffs over raw line counts on minified
   bundles. When a signal is ambiguous, prefer NOTE/SUSPICIOUS over silently
   dropping it — but back every flag with a concrete, verifiable fact.

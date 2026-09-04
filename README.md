@@ -29,11 +29,16 @@ transitive, it pulls both versions straight from the registry, compares them,
 checks the change against the upstream changelog and the git tag/SHA it claims to
 come from, and goes looking for the specific move each ecosystem gets attacked
 through: a new install hook on npm or PyPI, a moved tag on a GitHub Action, a
-`build.rs` on a crate, an `init()` or cgo block on a Go module. The heavy
-per-package work runs in parallel Sonnet subagents, five at a time. What comes
-back is a verdict on the PR: inline comments on the lines that bump a flagged
-package, plus one summary comment carrying a table and a written report. You get
-the same report in the conversation.
+`build.rs` on a crate, an `init()` or cgo block on a Go module. It also performs a
+separate, read-only CI/build suitability review: it reconstructs the initial
+Dependabot commit versus the final head, preserves human/reverted dependency
+decisions, compares toolchain and image pins across CI/build/release paths, and
+maps those relationships to existing test contracts. It deliberately does not
+run a full API or desktop regression. The heavy per-package work runs in parallel
+Sonnet subagents, five at a time. What comes back is a two-track verdict on the
+PR: inline comments on flagged security or suitability findings, plus one summary
+comment carrying both tables and a written report. You get the same report in the
+conversation.
 
 It's a defensive tool. The job is to catch a compromised or malicious release
 before it merges, so it stays skeptical and cites a concrete fact for everything
@@ -47,23 +52,30 @@ it flags; it won't manufacture findings to look busy.
    bumps and usually omits the transitive ones; the manifest/lockfile diff is
    ground truth, so that's what gets parsed. Transitive releases are exactly where
    a malicious version likes to hide, so they're in scope.
-3. **Form audit units.** One per package. Monorepo packages that move in lockstep
-   to the same version can share a unit to save agents.
-4. **Fan out.** Units run in batches of five parallel Sonnet subagents. Each runs
-   the right bundled auditor, reads the official changelog, confirms any publisher
-   or maintainer change, and returns a structured verdict.
-5. **Aggregate** the unit verdicts into a single recommendation for the PR.
-6. **Post the audit.** Every non-clean unit gets a review comment anchored to the
-   line in the diff that declares its bump, and the PR gets one idempotent summary
-   comment. Hidden markers (`dependa-audit:finding:<pkg>` and
-   `dependa-audit:summary`) let a re-run update its old comments in place instead
-   of stacking duplicates.
+3. **Reconstruct PR decisions and context.** Compare the initial Dependabot
+   commit with the final head and inspect later human commits/comments so reverted
+   toolchain or image changes remain visible.
+4. **Form audit units.** One per package, plus one CI/build suitability unit per
+   PR. Monorepo packages that move in lockstep to the same version can share a
+   package unit to save agents.
+5. **Fan out.** Units run in batches of five parallel Sonnet subagents. Each
+   security unit runs the right bundled auditor and reads the official changelog;
+   the suitability unit inventories version relationships, compatibility signals,
+   and existing CI/test coverage.
+6. **Aggregate** the security and suitability verdicts into one recommendation.
+7. **Post the audit.** Every non-clean security or non-clear suitability unit gets
+   a review comment anchored to the relevant diff line when possible, and the PR
+   gets one idempotent summary comment. Hidden markers
+   (`dependa-audit:finding:<pkg>`, `dependa-audit:suitability:<scope>`, and
+   `dependa-audit:summary`) let a re-run update old comments in place instead of
+   stacking duplicates.
 
 ## Helper scripts
 
-Six scripts in [`scripts/`](scripts/) do the per-ecosystem registry and archive
-work. Each prints a bounded, structured report (no raw bundle dumps) that ends in
-an INTERPRETATION GUIDE, written to be read by a subagent.
+Seven scripts in [`scripts/`](scripts/) do the per-ecosystem registry, archive, and
+read-only repository-context work. Each prints a bounded, structured report (no raw
+bundle dumps) that ends in an INTERPRETATION GUIDE or suitability result, written to
+be read by a subagent.
 
 | Script | Ecosystem | Key checks |
 |--------|-----------|------------|
@@ -73,12 +85,26 @@ an INTERPRETATION GUIDE, written to be read by a subagent.
 | [`docker-audit.sh`](scripts/docker-audit.sh) `<image> <from-digest> <to-digest> [tag]` | Docker Hub | **tag integrity** (does the new digest match what the registry serves for the tag?), entrypoint/cmd/user/env/label diff, layer-command history. Prints a `docker buildx imagetools inspect` fallback for other registries |
 | [`gha-audit.sh`](scripts/gha-audit.sh) `<owner/repo> <from-ref> <to-ref>` | GitHub Actions | **ref/tag integrity** (does the new SHA map to a real published tag, or did a tag move under you, as in the tj-actions case), `action.yml` execution-model change (node/docker/composite) and diff, env-injection into `$GITHUB_ENV`/`$GITHUB_PATH`, changed-file classification, known advisories |
 | [`go-audit.sh`](scripts/go-audit.sh) `<module> <from> <to>` | Go modules | checksum transparency-log presence (`sum.golang.org`) and VCS-origin/tag match, the surfaces Go actually runs code through (`init()`, cgo/`#cgo`, `//go:generate`, `//go:linkname`), `go.mod` require/replace diff, new network hosts, embedded-payload scan |
+| [`suitability-audit.sh`](scripts/suitability-audit.sh) `<pr> [owner/repo]` | CI/build suitability | initial-vs-final PR history, human/reverted decisions, CI/toolchain/image/package-manager version matrix, build/release paths, and targeted existing test-contract coverage; read-only, no checkout/build/test |
 
 npm, crate, python, docker, and go hit anonymous public registry APIs; gha-audit
 goes through your authenticated `gh` so it can read the Actions repo and its
-advisories. None of them installs a package, runs a build, or needs a daemon.
+advisories. The suitability script uses authenticated GitHub API reads for the PR
+and its final tree. Pass `owner/repo` when invoking it outside the target checkout,
+or provide a full GitHub PR URL so it can resolve the repository itself. None of
+these scripts installs a package, checks out a branch, runs a build/test, or needs
+a daemon.
+
+Suitability is intentionally a separate track from supply-chain security. A
+major/minor mismatch, unsupported engine/MSRV, unexplained human revert, or
+changed production build path without suitable coverage is a `CONCERN`; an
+explained patch-level drift or low-risk coverage gap is a `NOTE`. The reviewer
+must cite the relevant pins, human rationale, and existing CI/test contract rather
+than treating every version difference as a failure.
 
 ## Verdict levels
+
+Security verdicts:
 
 | Verdict | Meaning |
 |---------|---------|
@@ -87,9 +113,19 @@ advisories. None of them installs a package, runs a build, or needs a daemon.
 | 🟠 **SUSPICIOUS** | A real anomaly that needs a human to look before merge. |
 | 🔴 **BLOCK** | Evidence of a malicious or compromised release. |
 
-The PR-level recommendation is the worst single verdict: any BLOCK means *do not
-merge*; otherwise any SUSPICIOUS means *hold for human review*; otherwise any NOTE
-means *safe to merge, notes below*; otherwise *safe to merge*.
+Suitability verdicts:
+
+| Verdict | Meaning |
+|---------|---------|
+| ✅ **CLEAR** | Relevant CI/build relationships are aligned or explicitly justified and covered. |
+| 🟡 **NOTE** | An explained skew or low-risk coverage gap should be recorded, but does not block merging. |
+| 🟠 **CONCERN** | An unresolved compatibility relationship, unsupported engine/MSRV, unexplained decision, or changed production build path lacks suitable coverage. |
+
+The PR-level recommendation is the stricter of the two tracks: any security BLOCK
+means *do not merge*; any security SUSPICIOUS or suitability CONCERN means *hold for
+human review*; security or suitability NOTE means *safe to merge, notes below*;
+otherwise *safe to merge*. A missing compatibility test alone is not evidence of a
+compromised dependency.
 
 ## Installation
 
@@ -145,8 +181,8 @@ current branch if there is one. It audits **one PR per invocation**.
 ## Requirements
 
 - [`gh`](https://cli.github.com/), authenticated. It handles all GitHub I/O:
-  reading the PR, posting comments, and the Actions repo/advisory calls inside
-  `gha-audit.sh`.
+  reading PR metadata/history/tree, posting comments, and the Actions repo/advisory
+  calls inside `gha-audit.sh`.
 - `curl` and `jq` for the registry I/O every script does.
 - `npm` for the `npm pack` that `npm-audit.sh` runs.
 - `tar` to extract the npm, cargo, and PyPI archives. `go-audit.sh` wants `unzip`
@@ -184,5 +220,6 @@ unexplained, and runtime-reachable**.
     ├── docker-audit.sh
     ├── python-audit.sh
     ├── gha-audit.sh
-    └── go-audit.sh
+    ├── go-audit.sh
+    └── suitability-audit.sh
 ```
