@@ -1,6 +1,7 @@
 ---
 name: dependa-audit
 description: Supply-chain and CI/build suitability audit of a Dependabot PR. For every dependency the PR bumps, diff the current vs target version for supply-chain risk, then review version alignment, build-image/toolchain compatibility, PR-history decisions, and existing CI coverage using parallel Sonnet subagents. Post a PR comment with both verdicts and a written report.
+disable-model-invocation: true
 allowed-tools:
   - Bash(gh pr view:*)
   - Bash(gh pr list:*)
@@ -33,7 +34,7 @@ version skew between CI, toolchain declarations, Docker images, package managers
 and release paths; human decisions or reverted updates in the PR history; and
 compatibility checks not covered by existing test scenarios. This is a focused
 static suitability review, not a replacement for full API or desktop regression
-coverage. The expensive work runs in **parallel Sonnet subagents (max 5 concurrent)**.
+coverage. The expensive work runs in **parallel Sonnet subagents (max 20 concurrent)**.
 The result is a PR comment with security and suitability verdicts plus a written
 report, and the same report shown to the user.
 
@@ -79,6 +80,10 @@ INTERPRETATION GUIDE.
   or run the target project's tests.
 
 ## Steps
+
+Model policy: wherever a step says "Haiku agent", use the **latest Haiku** model; wherever a step says Sonnet, use the **latest Sonnet** model.
+
+Parallelism: when workflow tooling (e.g. a `workflow` tool with `parallel()`) is available, prefer it for the step 7 fan-out — run the audit units as a single workflow with concurrency up to 20 — instead of dispatching individual Agent calls. Otherwise, batch multiple Agent calls per message as described in step 7.
 
 Make a todo list first.
 
@@ -129,9 +134,11 @@ Make a todo list first.
 6. **Make a todo entry per supply-chain and suitability unit** so progress is
    visible.
 
-7. **Fan out — parallel Sonnet subagents, at most 5 running at once.** Dispatch
-   units in batches of ≤5 (multiple Agent calls in one message = concurrent), wait
-   for the batch, then dispatch the next, until all units are done. Every audit
+7. **Fan out — parallel Sonnet subagents, up to 20 running at once.** If
+   workflow tooling is available, run all units through one workflow with
+   `parallel()` and concurrency up to 20. Otherwise, dispatch units in batches
+   of ≤20 (multiple Agent calls in one message = concurrent), wait for the
+   batch, then dispatch the next, until all units are done. Every audit
    subagent uses model **sonnet** (the latest Sonnet) and `subagent_type:
    general-purpose`. Give each subagent this brief (filled in for its unit):
 
@@ -425,8 +432,8 @@ reviewer briefing a teammate.
 
 ## Notes
 
-- **Parallelism is capped at 5** concurrent subagents; audit model is the **latest
-  Sonnet**. Cheap orchestration fetches (steps 1, 2, 3, 9) may use Haiku.
+- **Parallelism is capped at 20** concurrent subagents; audit model is the **latest
+  Sonnet**. Cheap orchestration fetches (steps 1, 2, 3, 9) may use the latest Haiku.
 - Use `gh` for all GitHub I/O; the bundled scripts handle registry and read-only
   repository-context I/O.
 - Do not run the project's own build/tests, checkout its PR branch, or modify the
